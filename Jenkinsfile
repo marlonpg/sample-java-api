@@ -1,74 +1,135 @@
-// Jenkinsfile
-
 pipeline {
-    // 1. Define the build agent. This must match the label in jenkins-values.yaml
-    agent {
-        label 'jenkins-maven-agent'
+  agent {
+    kubernetes {
+      label 'kaniko-maven-ci-fix-chown'
+      namespace 'infra'  
+      yaml '''
+apiVersion: v1
+kind: Pod
+spec:
+  volumes:
+    - name: home
+      emptyDir: {}
+    - name: kaniko-cache
+      emptyDir: {}
+    - name: maven-repo
+      emptyDir: {}
+
+  containers:
+    # ----- GIT (non-root) -----
+    - name: git
+      image: alpine/git:2.45.2
+      tty: true
+      env:
+        - name: HOME
+          value: /home/jenkins
+      command: ["/bin/sh","-lc","tail -f /dev/null"]
+      volumeMounts:
+        - name: home
+          mountPath: /home/jenkins
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+
+    # ----- MAVEN (non-root) -----
+    - name: maven
+      image: maven:3.9-eclipse-temurin-21
+      tty: true
+      env:
+        - name: HOME
+          value: /home/jenkins
+        - name: MAVEN_CONFIG
+          value: /home/jenkins/.m2
+      command: ["/bin/sh","-lc","tail -f /dev/null"]
+      volumeMounts:
+        - name: home
+          mountPath: /home/jenkins
+        - name: maven-repo
+          mountPath: /home/jenkins/.m2
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+
+    # ----- KANIKO (root to allow chown during unpack) -----
+    - name: kaniko
+      image: gcr.io/kaniko-project/executor:debug
+      tty: true
+      env:
+        - name: HOME
+          value: /home/jenkins
+      command: ["/busybox/sh","-c","tail -f /dev/null"]
+      volumeMounts:
+        - name: home
+          mountPath: /home/jenkins
+        - name: kaniko-cache
+          mountPath: /kaniko/cache
+      securityContext:
+        runAsUser: 0       # ← important: Kaniko needs root to chown files when unpacking base image
+'''
+    }
+  }
+
+  environment {
+    IMAGE = 'gambadeveloper/sample-java-api'     
+    GIT_URL = 'https://github.com/marlonpg/sample-java-api.git' 
+    GIT_BRANCH = 'main'                          
+    GIT_CREDS = 'git-creds'                      
+    REGISTRY_CREDS = 'dockerhub-creds' // Create this credential in Jenkins, password must be the docker-hub token
+  }
+
+  stages {
+    stage('Checkout code from Github') {
+      steps {
+        deleteDir()
+        container('git') {
+          sh 'echo HOME=$HOME && id && ls -ld "$HOME"'
+          sh 'git config --global --add safe.directory "$WORKSPACE"'
+          git branch: env.GIT_BRANCH, url: env.GIT_URL, credentialsId: env.GIT_CREDS
+          sh 'git rev-parse --short HEAD'
+        }
+      }
     }
 
-    // 2. Environment variables used throughout the pipeline
-    environment {
-        // The name of the Docker image we will build
-        IMAGE_NAME = "sample-java-api"
-        // The path to the GENERIC application's Helm chart in the platform repo
-        HELM_CHART_PATH = "helm/charts/generic-app"
-        // The Helm release name for the deployment
-        HELM_RELEASE_NAME = "sample-java-api"
+    stage('Build app') {
+      steps {
+        container('maven') {
+          sh 'mvn -B -DskipTests package'
+        }
+      }
     }
 
-    stages {
-        // 3. Stage to run tests. The pipeline will fail here if tests fail.
-        stage('Run Tests') {
-            steps {
-                // Use the 'maven' container from our agent pod
-                container('maven') {
-                    sh 'mvn test'
-                }
-            }
-        }
+    stage('Publish image to registry') {
+      steps {
+        container('kaniko') {
+          withCredentials([usernamePassword(credentialsId: env.REGISTRY_CREDS, usernameVariable: 'USER', passwordVariable: 'PASS')]) {
+            sh '''
+              set -euo pipefail
+              : "${WORKSPACE:?WORKSPACE not set}"
 
-        // 4. Stage to compile the code and package it into a .jar file
-        stage('Package Application') {
-            steps {
-                container('maven') {
-                    // Skip tests since they already ran
-                    sh 'mvn package -DskipTests'
-                }
-            }
-        }
+              CFG_DIR="$WORKSPACE/.docker"
+              DIGEST_PATH="$WORKSPACE/.kaniko-image.digest"
+              mkdir -p "$CFG_DIR"
 
-        // 5. Stage to build a Docker image
-        stage('Build Docker Image') {
-            steps {
-                // Use the 'docker' container from our agent pod
-                container('docker') {
-                    // Build the image and tag it with the Jenkins BUILD_ID
-                    sh "docker build -t ${env.IMAGE_NAME}:${env.BUILD_ID} ."
-                }
-            }
-        }
+              # Docker Hub auth (base64 "user:token")
+              AUTH="$(printf "%s:%s" "$USER" "$PASS" | base64 | tr -d '\\n')"
+              printf '{ "auths": { "https://index.docker.io/v1/": { "auth": "%s" } } }\n' "$AUTH" > "$CFG_DIR/config.json"
+              export DOCKER_CONFIG="$CFG_DIR"
 
-        // 6. Stage to deploy the application using Helm
-        stage('Deploy to Kubernetes') {
-            steps {
-                // Use the 'helm' container from our agent pod
-                container('helm') {
-                    // We need to check out the devops-platform repo to get the Helm chart
-                    // This assumes your my-devops-platform project is also in a Git repo
-                    // For this example, we'll use a placeholder URL.
-                    // IMPORTANT: Replace this with the actual URL to your devops platform repo
-                    git url: 'https://github.com/your-username/my-devops-platform.git', branch: 'main'
+              echo "Building & pushing docker.io/${IMAGE#docker.io/}:${BUILD_NUMBER}"
+              /kaniko/executor \
+                --context "$WORKSPACE" \
+                --dockerfile "$WORKSPACE/Dockerfile" \
+                --destination "docker.io/${IMAGE#docker.io/}:${BUILD_NUMBER}" \
+                --destination "docker.io/${IMAGE#docker.io/}:latest" \
+                --cache=true --cache-dir=/kaniko/cache \
+                --verbosity=info \
+                --digest-file "$DIGEST_PATH"
 
-                    // Run the helm upgrade command
-                    sh """
-                        helm upgrade --install ${env.HELM_RELEASE_NAME} ./${env.HELM_CHART_PATH} \\
-                             --namespace apps \\
-                             --set image.repository=${env.IMAGE_NAME} \\
-                             --set image.tag=${env.BUILD_ID} \\
-                             --set image.pullPolicy=Never
-                    """
-                }
-            }
+              [ -f "$DIGEST_PATH" ] && echo "Pushed digest: $(cat "$DIGEST_PATH")"
+            '''
+          }
         }
+      }
     }
+  }
 }
